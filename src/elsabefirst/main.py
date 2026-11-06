@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from elsabefirst.database import connection_for, initialize_database
+from elsabefirst.passwords import DUMMY_HASH, hash_password, verify_password
 from elsabefirst.schemas import (
     AuthenticatedUser,
     LoginRequest,
@@ -20,6 +21,8 @@ from elsabefirst.schemas import (
     NoteUpdate,
     OtpRequested,
     OtpVerification,
+    PasswordLogin,
+    PasswordReset,
     User,
     UserCreate,
     UserUpdate,
@@ -134,14 +137,7 @@ def create_app(database: Path | None = None) -> FastAPI:
 
     @application.post("/api/auth/request-otp", response_model=OtpRequested)
     def request_otp(payload: LoginRequest, db: Db) -> OtpRequested:
-        identifier = payload.identifier.strip()
-        row = db.execute(
-            """
-            SELECT * FROM users
-            WHERE email = ? COLLATE NOCASE OR cellno = ?
-            """,
-            (identifier.lower(), identifier),
-        ).fetchone()
+        row = find_user_by_identifier(db, payload.identifier)
         if row is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -168,15 +164,29 @@ def create_app(database: Path | None = None) -> FastAPI:
             message="Temporary token created. Enter the OTP to complete sign-in.",
         )
 
-    @application.post("/api/auth/verify-otp", response_model=AuthenticatedUser)
-    def verify_otp(payload: OtpVerification, db: Db) -> AuthenticatedUser:
-        if payload.otp != DEVELOPMENT_OTP:
+    def find_user_by_identifier(db: sqlite3.Connection, identifier: str):
+        identifier = identifier.strip()
+        return db.execute(
+            """
+            SELECT * FROM users
+            WHERE email = ? COLLATE NOCASE OR cellno = ?
+            """,
+            (identifier.lower(), identifier),
+        ).fetchone()
+
+    def consume_temporary_token(
+        db: sqlite3.Connection, temporary_token: str, otp: str, now: datetime
+    ) -> int:
+        """Validate the OTP challenge, mark it used, and return its user id.
+
+        Starts a write transaction that the caller must commit.
+        """
+        if otp != DEVELOPMENT_OTP:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="The OTP is incorrect",
             )
         db.execute("BEGIN IMMEDIATE")
-        now = utc_now()
         temporary = db.execute(
             """
             SELECT * FROM tokens
@@ -185,7 +195,7 @@ def create_app(database: Path | None = None) -> FastAPI:
               AND revoked_at IS NULL
               AND expires_at > ?
             """,
-            (token_digest(payload.temporary_token), now.isoformat()),
+            (token_digest(temporary_token), now.isoformat()),
         ).fetchone()
         if temporary is None:
             db.rollback()
@@ -193,11 +203,15 @@ def create_app(database: Path | None = None) -> FastAPI:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Temporary token is invalid, expired, or already used",
             )
-
         db.execute(
             "UPDATE tokens SET revoked_at = ? WHERE token_hash = ?",
             (now.isoformat(), temporary["token_hash"]),
         )
+        return temporary["user_id"]
+
+    def issue_access_token(
+        db: sqlite3.Connection, user_id: int, now: datetime
+    ) -> str:
         access_token = secrets.token_urlsafe(48)
         db.execute(
             """
@@ -206,21 +220,72 @@ def create_app(database: Path | None = None) -> FastAPI:
             """,
             (
                 token_digest(access_token),
-                temporary["user_id"],
+                user_id,
                 token_expiration("access").isoformat(),
                 now.isoformat(),
             ),
         )
-        user_row = db.execute(
-            "SELECT * FROM users WHERE id = ?", (temporary["user_id"],)
-        ).fetchone()
-        db.commit()
+        return access_token
+
+    def authenticated_response(
+        db: sqlite3.Connection, user_id: int, access_token: str
+    ) -> AuthenticatedUser:
+        user_row = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         if user_row is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User no longer exists",
             )
         return AuthenticatedUser(token=access_token, user=row_to_user(user_row))
+
+    @application.post("/api/auth/verify-otp", response_model=AuthenticatedUser)
+    def verify_otp(payload: OtpVerification, db: Db) -> AuthenticatedUser:
+        now = utc_now()
+        user_id = consume_temporary_token(db, payload.temporary_token, payload.otp, now)
+        access_token = issue_access_token(db, user_id, now)
+        db.commit()
+        return authenticated_response(db, user_id, access_token)
+
+    @application.post("/api/auth/login", response_model=AuthenticatedUser)
+    def login_with_password(payload: PasswordLogin, db: Db) -> AuthenticatedUser:
+        row = find_user_by_identifier(db, payload.identifier)
+        stored_hash = row["password_hash"] if row is not None else None
+        # Always run a hash check so timing doesn't reveal whether the account
+        # exists or has a password set.
+        valid = verify_password(payload.password, stored_hash or DUMMY_HASH)
+        if row is None or stored_hash is None or not valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="The email/mobile number or password is incorrect",
+            )
+        now = utc_now()
+        access_token = issue_access_token(db, row["id"], now)
+        db.commit()
+        return authenticated_response(db, row["id"], access_token)
+
+    @application.post("/api/auth/reset-password", response_model=AuthenticatedUser)
+    def reset_password(payload: PasswordReset, db: Db) -> AuthenticatedUser:
+        """Set a new password after proving identity with an OTP challenge.
+
+        Also used to set a password for the first time. Existing sessions are
+        signed out and a fresh access token is returned.
+        """
+        now = utc_now()
+        user_id = consume_temporary_token(db, payload.temporary_token, payload.otp, now)
+        db.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(payload.new_password), user_id),
+        )
+        db.execute(
+            """
+            UPDATE tokens SET revoked_at = ?
+            WHERE user_id = ? AND token_type = 'access' AND revoked_at IS NULL
+            """,
+            (now.isoformat(), user_id),
+        )
+        access_token = issue_access_token(db, user_id, now)
+        db.commit()
+        return authenticated_response(db, user_id, access_token)
 
     @application.get("/api/auth/userhandler", response_model=User)
     def userhandler(user: CurrentUser) -> User:

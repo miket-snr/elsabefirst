@@ -40,6 +40,25 @@ export const api = {
       },
       null,
     ),
+  loginWithPassword: (identifier: string, password: string) =>
+    request<AuthResponse>(
+      "/api/auth/login",
+      { method: "POST", body: JSON.stringify({ identifier, password }) },
+      null,
+    ),
+  resetPassword: (temporaryToken: string, otp: string, newPassword: string) =>
+    request<AuthResponse>(
+      "/api/auth/reset-password",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          temporary_token: temporaryToken,
+          otp,
+          new_password: newPassword,
+        }),
+      },
+      null,
+    ),
   logout: () => request<void>("/api/auth/logout", { method: "POST" }),
   listUsers: () => request<User[]>("/api/users"),
   createUser: (fields: UserFields) =>

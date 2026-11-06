@@ -1,8 +1,12 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
 import { api, TOKEN_KEY } from "../api";
-import type { User } from "../types";
+import type { AuthResponse, User } from "../types";
 import brandLogo from "../Screenshot 2026-03-06 134726.png";
+
+type Stage = "identifier" | "otp" | "reset";
+
+const MIN_PASSWORD_LENGTH = 8;
 
 interface LoginProps {
   onSignedIn: (user: User) => void;
@@ -10,41 +14,106 @@ interface LoginProps {
 
 export default function Login({ onSignedIn }: LoginProps) {
   const [identifier, setIdentifier] = useState("");
+  const [password, setPassword] = useState("");
   const [temporaryToken, setTemporaryToken] = useState("");
   const [otp, setOtp] = useState("");
-  const [stage, setStage] = useState<"identifier" | "otp">("identifier");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [stage, setStage] = useState<Stage>("identifier");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
-  async function requestOtp(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  function completeSignIn(result: AuthResponse) {
+    localStorage.setItem(TOKEN_KEY, result.token);
+    onSignedIn(result.user);
+  }
+
+  async function run(action: () => Promise<void>, fallback: string) {
     setBusy(true);
     setError("");
     try {
-      const result = await api.requestOtp(identifier);
-      setTemporaryToken(result.temporary_token);
-      setStage("otp");
+      await action();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not start sign-in");
+      setError(reason instanceof Error ? reason.message : fallback);
     } finally {
       setBusy(false);
     }
   }
 
-  async function verifyOtp(event: FormEvent<HTMLFormElement>) {
+  async function startOtpChallenge(nextStage: "otp" | "reset") {
+    const result = await api.requestOtp(identifier);
+    setTemporaryToken(result.temporary_token);
+    setOtp("");
+    setStage(nextStage);
+  }
+
+  function signIn(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      const result = await api.verifyOtp(temporaryToken, otp);
-      localStorage.setItem(TOKEN_KEY, result.token);
-      onSignedIn(result.user);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not verify OTP");
-    } finally {
-      setBusy(false);
+    if (password) {
+      void run(
+        async () => completeSignIn(await api.loginWithPassword(identifier, password)),
+        "Could not sign in",
+      );
+    } else {
+      void run(() => startOtpChallenge("otp"), "Could not start sign-in");
     }
   }
+
+  function forgotPassword() {
+    if (identifier.trim().length < 3) {
+      setError("Enter your email address or mobile number first.");
+      return;
+    }
+    setPassword("");
+    setNewPassword("");
+    setConfirmPassword("");
+    void run(() => startOtpChallenge("reset"), "Could not start password reset");
+  }
+
+  function verifyOtp(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    void run(
+      async () => completeSignIn(await api.verifyOtp(temporaryToken, otp)),
+      "Could not verify OTP",
+    );
+  }
+
+  function resetPassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+      setError(`Your new password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setError("The passwords do not match.");
+      return;
+    }
+    void run(
+      async () => completeSignIn(await api.resetPassword(temporaryToken, otp, newPassword)),
+      "Could not reset password",
+    );
+  }
+
+  function backToSignIn() {
+    setStage("identifier");
+    setTemporaryToken("");
+    setOtp("");
+    setNewPassword("");
+    setConfirmPassword("");
+    setError("");
+  }
+
+  const heading: Record<Stage, string> = {
+    identifier: "Sign in to your account",
+    otp: "Check your details",
+    reset: "Reset your password",
+  };
+  const intro: Record<Stage, string> = {
+    identifier:
+      "Enter your email address or mobile number and your password. No password yet? Leave it blank and we’ll send you a one-time code.",
+    otp: `We’ve sent a one-time code for ${identifier}. Enter it to continue.`,
+    reset: `We’ve sent a one-time code for ${identifier}. Enter it along with your new password.`,
+  };
 
   return (
     <main className="grid min-h-screen bg-white lg:grid-cols-[1.05fr_0.95fr]">
@@ -80,18 +149,12 @@ export default function Login({ onSignedIn }: LoginProps) {
             <p className="mb-3 text-sm font-semibold uppercase tracking-[0.18em] text-brand">
               Welcome back
             </p>
-            <h2 className="text-3xl font-semibold tracking-tight text-ink">
-              {stage === "identifier" ? "Sign in to your account" : "Check your details"}
-            </h2>
-            <p className="mt-3 leading-6 text-muted">
-              {stage === "identifier"
-                ? "Enter the email address or mobile number associated with your account."
-                : `We’ve created a sign-in challenge for ${identifier}. Enter your one-time code to continue.`}
-            </p>
+            <h2 className="text-3xl font-semibold tracking-tight text-ink">{heading[stage]}</h2>
+            <p className="mt-3 leading-6 text-muted">{intro[stage]}</p>
           </div>
 
-          {stage === "identifier" ? (
-            <form className="space-y-5" onSubmit={requestOtp}>
+          {stage === "identifier" && (
+            <form className="space-y-5" onSubmit={signIn}>
               <label className="block">
                 <span className="mb-2 block text-sm font-medium text-ink">Email or mobile number</span>
                 <input
@@ -103,12 +166,38 @@ export default function Login({ onSignedIn }: LoginProps) {
                   value={identifier}
                 />
               </label>
+              <div>
+                <div className="mb-2 flex items-baseline justify-between">
+                  <label className="text-sm font-medium text-ink" htmlFor="login-password">
+                    Password <span className="font-normal text-muted">(optional)</span>
+                  </label>
+                  <button
+                    className="text-sm font-medium text-brand hover:underline disabled:opacity-60"
+                    disabled={busy}
+                    onClick={forgotPassword}
+                    type="button"
+                  >
+                    Forgot password?
+                  </button>
+                </div>
+                <input
+                  autoComplete="current-password"
+                  className="field"
+                  id="login-password"
+                  onChange={(event) => setPassword(event.target.value)}
+                  placeholder="Leave blank to sign in with a one-time code"
+                  type="password"
+                  value={password}
+                />
+              </div>
               <button className="primary-button w-full" disabled={busy} type="submit">
-                {busy ? "Please wait…" : "Continue"}
+                {busy ? "Please wait…" : password ? "Sign in" : "Send one-time code"}
                 {!busy && <span aria-hidden="true">→</span>}
               </button>
             </form>
-          ) : (
+          )}
+
+          {stage === "otp" && (
             <form className="space-y-5" onSubmit={verifyOtp}>
               <label className="block">
                 <span className="mb-2 block text-sm font-medium text-ink">One-time password</span>
@@ -127,15 +216,60 @@ export default function Login({ onSignedIn }: LoginProps) {
               </button>
               <button
                 className="w-full py-2 text-sm font-medium text-muted hover:text-ink"
-                onClick={() => {
-                  setStage("identifier");
-                  setTemporaryToken("");
-                  setOtp("");
-                  setError("");
-                }}
+                onClick={backToSignIn}
                 type="button"
               >
                 Use a different email or mobile
+              </button>
+            </form>
+          )}
+
+          {stage === "reset" && (
+            <form className="space-y-5" onSubmit={resetPassword}>
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-ink">One-time password</span>
+                <input
+                  autoComplete="one-time-code"
+                  className="field"
+                  onChange={(event) => setOtp(event.target.value)}
+                  placeholder="Enter your OTP"
+                  required
+                  value={otp}
+                />
+              </label>
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-ink">New password</span>
+                <input
+                  autoComplete="new-password"
+                  className="field"
+                  onChange={(event) => setNewPassword(event.target.value)}
+                  placeholder={`At least ${MIN_PASSWORD_LENGTH} characters`}
+                  required
+                  type="password"
+                  value={newPassword}
+                />
+              </label>
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-ink">Confirm new password</span>
+                <input
+                  autoComplete="new-password"
+                  className="field"
+                  onChange={(event) => setConfirmPassword(event.target.value)}
+                  required
+                  type="password"
+                  value={confirmPassword}
+                />
+              </label>
+              <button className="primary-button w-full" disabled={busy} type="submit">
+                {busy ? "Saving…" : "Reset password and sign in"}
+                {!busy && <span aria-hidden="true">→</span>}
+              </button>
+              <button
+                className="w-full py-2 text-sm font-medium text-muted hover:text-ink"
+                onClick={backToSignIn}
+                type="button"
+              >
+                Back to sign in
               </button>
             </form>
           )}
@@ -148,7 +282,8 @@ export default function Login({ onSignedIn }: LoginProps) {
           <div className="mt-8 rounded-xl bg-canvas px-4 py-3 text-sm leading-6 text-muted">
             <span className="font-semibold text-ink">Development access:</span>{" "}
             Demo account <code className="rounded bg-white px-1.5 py-0.5 text-ink">demo@example.com</code>,
-            OTP <code className="rounded bg-white px-1.5 py-0.5 text-ink">Hellothere</code>.
+            OTP <code className="rounded bg-white px-1.5 py-0.5 text-ink">Hellothere</code>. Use
+            “Forgot password?” to set a password.
           </div>
         </div>
       </section>

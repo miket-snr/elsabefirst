@@ -43,6 +43,12 @@ On an empty database, the API creates a demo user:
 - Mobile: `+15550101000`
 - Development OTP: `Hellothere`
 
+On the sign-in screen, entering a password signs in with that password; leaving
+it blank sends a one-time code instead. "Forgot password?" uses an OTP to set or
+reset the password. Passwords are stored as salted scrypt hashes in the
+`users.password_hash` column, which is added automatically to existing
+databases.
+
 The OTP is fixed for development only. Replace it with a real delivery and
 verification mechanism before production use. Configure allowed browser origins
 with comma-separated `CORS_ORIGINS`; by default the Vite localhost origins are
@@ -83,6 +89,13 @@ npm run build
   short-lived temporary token.
 - `POST /api/auth/verify-otp` — accepts that temporary token and OTP, then
   returns user details and an access token.
+- `POST /api/auth/login` — accepts an email or mobile number and password, then
+  returns user details and an access token. Accounts without a password use
+  the OTP flow instead.
+- `POST /api/auth/reset-password` — accepts a temporary token from
+  `request-otp`, the OTP, and a `new_password` (at least 8 characters). Sets or
+  replaces the password, signs out the user's other sessions, and returns a new
+  access token.
 - `GET /api/auth/userhandler` — validates a bearer access token and returns the
   associated user.
 - `GET /api/users`, `POST /api/users`, and `PUT /api/users/{user_id}` — list,

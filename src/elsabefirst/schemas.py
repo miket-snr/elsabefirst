@@ -97,6 +97,21 @@ class OtpVerification(BaseModel):
     otp: str = Field(min_length=1, max_length=100)
 
 
+class PasswordLogin(LoginRequest):
+    password: str = Field(min_length=1, max_length=128)
+
+
+class PasswordReset(OtpVerification):
+    new_password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Password cannot be blank")
+        return value
+
+
 class OtpRequested(BaseModel):
     temporary_token: str
     message: str

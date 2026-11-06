@@ -80,6 +80,11 @@ def initialize_database(path: Path | None = None) -> None:
                 ON notes(user_id, updated_at DESC);
             """
         )
+        user_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(users)")
+        }
+        if "password_hash" not in user_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
         user_count = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if user_count == 0:
             connection.execute(

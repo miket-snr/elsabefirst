@@ -242,3 +242,133 @@ def test_note_title_and_content_are_required(client: TestClient):
         headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 422
+
+
+def reset_password(client: TestClient, identifier: str, new_password: str):
+    requested = client.post("/api/auth/request-otp", json={"identifier": identifier})
+    assert requested.status_code == 200
+    return client.post(
+        "/api/auth/reset-password",
+        json={
+            "temporary_token": requested.json()["temporary_token"],
+            "otp": "Hellothere",
+            "new_password": new_password,
+        },
+    )
+
+
+def test_password_login_fails_when_no_password_is_set(client: TestClient):
+    response = client.post(
+        "/api/auth/login",
+        json={"identifier": "demo@example.com", "password": "anything123"},
+    )
+    assert response.status_code == 401
+
+
+def test_password_can_be_reset_with_otp_and_used_to_sign_in(client: TestClient):
+    reset = reset_password(client, "demo@example.com", "correct-horse-1")
+    assert reset.status_code == 200
+    assert reset.json()["user"]["username"] == "demo"
+    assert "password_hash" not in reset.json()["user"]
+
+    by_email = client.post(
+        "/api/auth/login",
+        json={"identifier": "DEMO@example.com", "password": "correct-horse-1"},
+    )
+    assert by_email.status_code == 200
+    token = by_email.json()["token"]
+    assert (
+        client.get(
+            "/api/auth/userhandler", headers={"Authorization": f"Bearer {token}"}
+        ).status_code
+        == 200
+    )
+
+    by_cellno = client.post(
+        "/api/auth/login",
+        json={"identifier": "+15550101000", "password": "correct-horse-1"},
+    )
+    assert by_cellno.status_code == 200
+
+
+def test_wrong_password_and_unknown_user_are_rejected(client: TestClient):
+    reset_password(client, "demo@example.com", "correct-horse-1")
+    wrong = client.post(
+        "/api/auth/login",
+        json={"identifier": "demo@example.com", "password": "wrong-password"},
+    )
+    unknown = client.post(
+        "/api/auth/login",
+        json={"identifier": "nobody@example.com", "password": "correct-horse-1"},
+    )
+    assert wrong.status_code == 401
+    assert unknown.status_code == 401
+    assert wrong.json()["detail"] == unknown.json()["detail"]
+
+
+def test_otp_login_still_works_after_password_is_set(client: TestClient):
+    reset_password(client, "demo@example.com", "correct-horse-1")
+    token, user = sign_in(client)
+    assert user["username"] == "demo"
+
+
+def test_password_reset_requires_correct_otp_and_single_use_token(client: TestClient):
+    requested = client.post(
+        "/api/auth/request-otp", json={"identifier": "demo@example.com"}
+    )
+    payload = {
+        "temporary_token": requested.json()["temporary_token"],
+        "otp": "wrong",
+        "new_password": "correct-horse-1",
+    }
+    assert client.post("/api/auth/reset-password", json=payload).status_code == 400
+
+    payload["otp"] = "Hellothere"
+    assert client.post("/api/auth/reset-password", json=payload).status_code == 200
+    assert client.post("/api/auth/reset-password", json=payload).status_code == 401
+
+
+def test_password_reset_rejects_short_passwords(client: TestClient):
+    response = reset_password(client, "demo@example.com", "short")
+    assert response.status_code == 422
+
+
+def test_password_reset_signs_out_existing_sessions(client: TestClient):
+    old_token, _ = sign_in(client)
+    reset = reset_password(client, "demo@example.com", "new-password-1")
+    new_token = reset.json()["token"]
+
+    old = client.get(
+        "/api/auth/userhandler", headers={"Authorization": f"Bearer {old_token}"}
+    )
+    new = client.get(
+        "/api/auth/userhandler", headers={"Authorization": f"Bearer {new_token}"}
+    )
+    assert old.status_code == 401
+    assert new.status_code == 200
+
+
+def test_existing_database_is_migrated_with_password_column(tmp_path: Path):
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.execute(
+        """
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            firstnames TEXT NOT NULL,
+            surname TEXT NOT NULL,
+            email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            cellno TEXT NOT NULL UNIQUE,
+            validfrom TEXT NOT NULL,
+            validto TEXT NOT NULL
+        )
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    with TestClient(create_app(db_path)) as migrated:
+        assert reset_password(migrated, "demo@example.com", "migrated-pw-1").status_code == 200
